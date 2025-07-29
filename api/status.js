@@ -1,18 +1,22 @@
 // api/status.js
-const Redis = require('ioredis'); // Import ioredis
+const { Pool } = require('pg'); // Import Node.js Postgres client
 
-// --- KONFIGURASI REDIS (MENGGUNAKAN REDIS_URL) ---
-// Pastikan REDIS_URL telah ditetapkan dalam Environment Variables Vercel anda
-const REDIS_URL = process.env.REDIS_URL;
-let redisClient; // Declare client outside to reuse connection
+// --- KONFIGURASI DATABASE POSTGRES (NEON) ---
+const POSTGRES_URL = process.env.POSTGRES_URL; // Gunakan URL sambungan penuh
 
-if (!REDIS_URL) {
-    console.error('ERROR: REDIS_URL environment variable is not set. Bot status control will not function correctly.');
+let pgPool;
+if (POSTGRES_URL) {
+    pgPool = new Pool({
+        connectionString: POSTGRES_URL,
+        ssl: {
+            rejectUnauthorized: false, // Penting untuk sambungan ke Neon dari Vercel
+        },
+    });
+
+    pgPool.on('connect', () => console.log('[INFO] Status page connected to Postgres!'));
+    pgPool.on('error', (err) => console.error('[ERROR] Status page Postgres Pool Error:', err));
 } else {
-    redisClient = new Redis(REDIS_URL);
-
-    redisClient.on('connect', () => console.log('[INFO] Status page connected to Redis!'));
-    redisClient.on('error', (err) => console.error('[ERROR] Status page Redis Client Error', err));
+    console.error('ERROR: POSTGRES_URL environment variable is not set. Bot status control will not function correctly.');
 }
 
 
@@ -84,40 +88,41 @@ function generateStatusPage(botIsOn, message = '') {
 // Fungsi utama untuk mengendalikan permintaan ke /api/status
 module.exports = async (req, res) => {
     let message = '';
-    let botIsOn = true; // Default status jika Redis tak dapat disambung
+    let botIsOn = true; // Default status jika DB tak dapat disambung
 
-    // Hanya cuba baca/tulis jika client Redis dah bersambung
-    if (redisClient) {
+    // Hanya cuba baca/tulis jika client Postgres dah bersambung
+    if (pgPool) {
         try {
-            const status = await redisClient.get('bot_status'); // Ambil dari Redis
-            if (status !== null) {
-                const parsedStatus = JSON.parse(status); // Redis simpan string, perlu parse
-                if (typeof parsedStatus === 'object' && typeof parsedStatus.isOn === 'boolean') {
-                    botIsOn = parsedStatus.isOn;
-                }
+            const result = await pgPool.query(
+                `SELECT is_on FROM bot_status WHERE status_key = 'main_bot_status'`
+            );
+            if (result.rows.length > 0) {
+                botIsOn = result.rows[0].is_on;
             } else {
-                // Jika status belum ada, inisialisasi ke ON
-                await redisClient.set('bot_status', JSON.stringify({ isOn: true }));
+                // Jika status key not found, initialize it and insert
+                await pgPool.query(
+                    `INSERT INTO bot_status (status_key, is_on) VALUES ('main_bot_status', TRUE)`
+                );
                 botIsOn = true;
-                console.log('[INFO] Bot status initialized to ON in Redis via /api/status.');
+                console.log('[INFO] Bot status initialized to ON in Postgres via /api/status.');
             }
         } catch (error) {
-            console.error(`[ERROR] Failed to read bot status from Redis in /api/status: ${error.message}. Assuming bot is ON.`);
+            console.error(`[ERROR] Failed to read bot status from Postgres in /api/status: ${error.message}. Assuming bot is ON.`);
             message = 'Ralat membaca status bot. Menganggap bot ON.';
         }
     } else {
-        console.warn('[WARNING] Redis client not initialized in /api/status. Bot status control may not function correctly.');
-        message = 'Ralat: Sambungan Redis tidak tersedia. Kawalan status mungkin tidak berfungsi.';
+        console.warn('[WARNING] Postgres client not initialized in /api/status. Bot status control may not function correctly.');
+        message = 'Ralat: Sambungan database tidak tersedia. Kawalan status mungkin tidak berfungsi.';
     }
 
 
     // Jika ada permintaan POST (untuk toggle status)
     if (req.method === 'POST') {
-        if (!redisClient) {
-            return res.status(500).send(generateStatusPage(botIsOn, 'Ralat: Sambungan Redis tidak tersedia. Tidak dapat menukar status.'));
+        if (!pgPool) {
+            return res.status(500).send(generateStatusPage(botIsOn, 'Ralat: Sambungan database tidak tersedia. Tidak dapat menukar status.'));
         }
 
-        const toggleAction = req.body.toggle; // Ambil nilai dari butang
+        const toggleAction = req.body.toggle;
         let newStatus = botIsOn;
 
         if (toggleAction === 'on') {
@@ -126,15 +131,18 @@ module.exports = async (req, res) => {
             newStatus = false;
         }
 
-        if (newStatus !== botIsOn) { // Hanya update jika status berubah
+        if (newStatus !== botIsOn) {
             try {
-                await redisClient.set('bot_status', JSON.stringify({ isOn: newStatus }));
+                await pgPool.query(
+                    `UPDATE bot_status SET is_on = $1 WHERE status_key = 'main_bot_status'`,
+                    [newStatus]
+                );
                 botIsOn = newStatus;
                 message = `Bot berjaya ditukar ke status: ${botIsOn ? 'ON' : 'OFF'}.`;
                 console.log(`[INFO] Bot status successfully toggled to ${botIsOn ? 'ON' : 'OFF'}.`);
             } catch (error) {
                 message = `Ralat menukar status bot: ${error.message}`;
-                console.error(`[ERROR] Failed to toggle bot status in Redis: ${error.message}`);
+                console.error(`[ERROR] Failed to toggle bot status in Postgres: ${error.message}`);
             }
         } else {
             message = `Bot sudah berada dalam status ${botIsOn ? 'ON' : 'OFF'}.`;

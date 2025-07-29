@@ -2,28 +2,14 @@
 
 // Import modul yang diperlukan
 const axios = require('axios');
-const Redis = require('ioredis'); // Import ioredis
+const { Pool } = require('pg'); // Import Node.js Postgres client
 
 // --- KELAYAKAN API (Diambil dari Environment Variables) ---
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.0-flash'; // Default model
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
 
 const ULTRAMSG_API_TOKEN = process.env.ULTRAMSG_API_TOKEN;
 const ULTRAMSG_INSTANCE_ID = process.env.ULTRAMSG_INSTANCE_ID;
-
-// --- KONFIGURASI REDIS (MENGGUNAKAN REDIS_URL) ---
-// Pastikan REDIS_URL telah ditetapkan dalam Environment Variables Vercel anda
-const REDIS_URL = process.env.REDIS_URL;
-let redisClient; // Declare client outside to reuse connection
-
-if (!REDIS_URL) {
-    console.error('ERROR: REDIS_URL environment variable is not set. Chat history and bot status will not persist.');
-} else {
-    redisClient = new Redis(REDIS_URL);
-
-    redisClient.on('connect', () => console.log('[INFO] Connected to Redis!'));
-    redisClient.on('error', (err) => console.error('[ERROR] Redis Client Error', err));
-}
 
 // --- NOMBOR TELEFON DIBENARKAN (Hardcoded) ---
 const ALLOWED_NUMBERS = [
@@ -59,69 +45,124 @@ const AI_RULES = [
 const AI_PERSONALITY = "You are a confident, laid-back guy with a “bad boy” charm. You speak casually in a mix of Bahasa Melayu and English, just like a real Malaysian guy texting on WhatsApp. You're bold, playful, and you enjoy teasing. Your replies are always very concise, often using shortforms, making them feel super natural and efficient like real WhatsApp texts. Your flirting is subtle and selective, only used when the context is right, not constant. You don’t try too hard to impress — your cool attitude speaks for itself. You keep your replies short, sometimes even one-liners, and you enjoy giving off mysterious, intriguing energy. You're smooth, never awkward, and you never sound like a robot. You flirt with style and confidence, always keeping it low effort, high impact, and situationally appropriate.";
 
 
+// --- KONFIGURASI DATABASE POSTGRES (NEON) ---
+const POSTGRES_URL = process.env.POSTGRES_URL; // Gunakan URL sambungan penuh
+
+let pgPool;
+if (POSTGRES_URL) {
+    pgPool = new Pool({
+        connectionString: POSTGRES_URL,
+        ssl: {
+            rejectUnauthorized: false, // Penting untuk sambungan ke Neon dari Vercel
+        },
+    });
+
+    pgPool.on('connect', () => console.log('[INFO] Connected to Postgres!'));
+    pgPool.on('error', (err) => console.error('[ERROR] Postgres Pool Error:', err));
+} else {
+    console.error('ERROR: POSTGRES_URL environment variable is not set. Database features will not work.');
+}
+
+
 // --- FUNGSI LOGGING (Guna console.log untuk Vercel logs) ---
 function logMessage(level, message) {
     const timestamp = new Date().toISOString();
     console.log(`[${timestamp}] [${level}] ${message}`);
 }
 
-// --- FUNGSI MANIPULASI CHAT HISTORY (Guna Redis) ---
+// --- FUNGSI MANIPULASI CHAT HISTORY (Guna Postgres) ---
 async function getWhatsAppUserChatHistory(userId) {
-    if (!redisClient) {
-        logMessage('WARNING', 'Redis client not initialized. Cannot load chat history.');
+    if (!pgPool) {
+        logMessage('WARNING', 'Postgres client not initialized. Cannot load chat history.');
         return [];
     }
     try {
-        const historyJson = await redisClient.get(`chat_history:${userId}`);
-        const history = historyJson ? JSON.parse(historyJson).messages : [];
-        return Array.isArray(history) ? history : [];
+        const result = await pgPool.query(
+            `SELECT role, message_text, timestamp FROM chat_history WHERE user_id = $1 ORDER BY timestamp ASC LIMIT 20`,
+            [userId]
+        );
+        return result.rows;
     } catch (error) {
-        logMessage('ERROR', `Failed to load chat history for ${userId} from Redis: ${error.message}`);
+        logMessage('ERROR', `Failed to load chat history for ${userId} from Postgres: ${error.message}`);
         return [];
     }
 }
 
 async function addWhatsAppMessageToHistory(userId, messageText, role) {
-    if (!redisClient) {
-        logMessage('WARNING', 'Redis client not initialized. Cannot save chat history.');
+    if (!pgPool) {
+        logMessage('WARNING', 'Postgres client not initialized. Cannot save chat history.');
         return false;
     }
     try {
-        let history = await getWhatsAppUserChatHistory(userId); // Get current history
-
-        const maxMessages = 20;
-        const newMessage = {
-            timestamp: new Date().toISOString(),
-            role: role,
-            message_text: messageText
-        };
-
-        history.push(newMessage);
-
-        if (history.length > maxMessages) {
-            history = history.slice(history.length - maxMessages);
-        }
-
-        await redisClient.set(`chat_history:${userId}`, JSON.stringify({ messages: history }));
-        logMessage('INFO', `Message added to Redis history for ${userId}. Current history length: ${history.length}`);
+        await pgPool.query(
+            `INSERT INTO chat_history (user_id, role, message_text) VALUES ($1, $2, $3)`,
+            [userId, role, messageText]
+        );
+        logMessage('INFO', `Message added to Postgres history for ${userId}.`);
         return true;
     } catch (error) {
-        logMessage('ERROR', `Failed to add message to Redis history for ${userId}: ${error.message}`);
+        logMessage('ERROR', `Failed to add message to Postgres history for ${userId}: ${error.message}`);
         return false;
     }
 }
 
 async function clearWhatsAppUserChatHistory(userId) {
-    if (!redisClient) {
-        logMessage('WARNING', 'Redis client not initialized. Cannot clear chat history.');
+    if (!pgPool) {
+        logMessage('WARNING', 'Postgres client not initialized. Cannot clear chat history.');
         return false;
     }
     try {
-        await redisClient.del(`chat_history:${userId}`);
-        logMessage('INFO', `Chat history cleared for ${userId} in Redis.`);
+        await pgPool.query(
+            `DELETE FROM chat_history WHERE user_id = $1`,
+            [userId]
+        );
+        logMessage('INFO', `Chat history cleared for ${userId} in Postgres.`);
         return true;
     } catch (error) {
-        logMessage('ERROR', `Failed to clear chat history for ${userId} in Redis: ${error.message}`);
+        logMessage('ERROR', `Failed to clear chat history for ${userId} in Postgres: ${error.message}`);
+        return false;
+    }
+}
+
+// --- FUNGSI MANIPULASI STATUS BOT (Guna Postgres) ---
+async function getBotStatus() {
+    if (!pgPool) {
+        logMessage('WARNING', 'Postgres client not initialized. Cannot load bot status.');
+        return { isOn: true, error: 'DB not connected' }; // Default to ON if DB issue
+    }
+    try {
+        const result = await pgPool.query(
+            `SELECT is_on FROM bot_status WHERE status_key = 'main_bot_status'`
+        );
+        if (result.rows.length > 0) {
+            return { isOn: result.rows[0].is_on };
+        } else {
+            // If status key not found, initialize it
+            await pgPool.query(
+                `INSERT INTO bot_status (status_key, is_on) VALUES ('main_bot_status', TRUE) ON CONFLICT (status_key) DO NOTHING`
+            );
+            return { isOn: true };
+        }
+    } catch (error) {
+        logMessage('ERROR', `Failed to get bot status from Postgres: ${error.message}. Defaulting to ON.`);
+        return { isOn: true, error: error.message };
+    }
+}
+
+async function setBotStatus(statusBoolean) {
+    if (!pgPool) {
+        logMessage('WARNING', 'Postgres client not initialized. Cannot set bot status.');
+        return false;
+    }
+    try {
+        await pgPool.query(
+            `INSERT INTO bot_status (status_key, is_on) VALUES ('main_bot_status', $1) ON CONFLICT (status_key) DO UPDATE SET is_on = $1`,
+            [statusBoolean]
+        );
+        logMessage('INFO', `Bot status set to ${statusBoolean} in Postgres.`);
+        return true;
+    } catch (error) {
+        logMessage('ERROR', `Failed to set bot status in Postgres: ${error.message}`);
         return false;
     }
 }
@@ -162,7 +203,7 @@ async function getGeminiResponse(promptText, aiRules, aiPersonality, userId) {
         }
         contents.push({ role: roleToAdd, parts: [{ text: textToAdd }] });
     }
-    logMessage('DEBUG', `Loaded ${chatHistory.length} messages from Redis history for user ID ${userId}.`);
+    logMessage('DEBUG', `Loaded ${chatHistory.length} messages from Postgres history for user ID ${userId}.`);
 
     contents.push({ role: 'user', parts: [{ text: promptText }] });
 
@@ -224,7 +265,7 @@ async function sendUltraMsgMessage(toPhoneNumber, text, replyToMessageId = null)
     logMessage('INFO', `Sending UltraMsg message to: ${toPhoneNumber}. Text: '${text}'`);
     
     const url = `https://api.ultramsg.com/${ULTRAMSG_INSTANCE_ID}/messages/chat?token=${ULTRAMSG_API_TOKEN}`; // Token di URL
-    const payload = new URLSearchParams(); // Guna URLSearchParams untuk form-urlencoded
+    const payload = new URLSearchParams();
     payload.append('to', toPhoneNumber);
     payload.append('body', escapeWhatsAppText(text));
 
@@ -259,39 +300,22 @@ async function sendUltraMsgMessage(toPhoneNumber, text, replyToMessageId = null)
 // FUNGSI UTAMA UNTUK MENGENDALIKAN PERMINTAAN WEBHOOK
 // -----------------------------------------------------------
 module.exports = async (req, res) => {
-    // Pastikan ini adalah permintaan POST
     if (req.method !== 'POST') {
         logMessage('WARNING', `Received non-POST request to webhook: ${req.method}`);
         return res.status(405).json({ status: 'error', message: 'Method Not Allowed' });
     }
 
     // --- Semak Status Bot ON/OFF ---
-    let isBotOn = true; // Default ke ON jika status tak dapat dibaca
-    if (redisClient) { // Hanya cuba baca jika client dah bersambung
-        try {
-            const status = await redisClient.get('bot_status'); // Ambil dari Redis
-            if (status !== null) {
-                const parsedStatus = JSON.parse(status); // Redis simpan string, perlu parse
-                if (typeof parsedStatus === 'object' && typeof parsedStatus.isOn === 'boolean') {
-                    isBotOn = parsedStatus.isOn;
-                }
-            } else {
-                // Jika status belum ada, setkan ke ON dan simpan
-                await redisClient.set('bot_status', JSON.stringify({ isOn: true }));
-                isBotOn = true;
-                logMessage('INFO', 'Bot status initialized to ON in Redis.');
-            }
-        } catch (error) {
-            logMessage('ERROR', `Failed to read bot status from Redis: ${error.message}. Assuming bot is ON.`);
-        }
-    } else {
-        logMessage('WARNING', 'Redis client not initialized. Cannot check bot status. Assuming bot is ON.');
+    let isBotOn = true; // Default ke ON
+    const botStatus = await getBotStatus(); // Dapatkan status dari DB
+    isBotOn = botStatus.isOn;
+    if (botStatus.error) {
+        logMessage('WARNING', `Error getting bot status: ${botStatus.error}. Assuming bot is ON.`);
     }
-
 
     if (!isBotOn) {
         logMessage('INFO', 'Bot is currently OFF. Ignoring incoming message.');
-        return res.status(200).json({ status: 'ok', message: 'Bot is OFF.' }); // Beritahu UltraMsg bot OFF
+        return res.status(200).json({ status: 'ok', message: 'Bot is OFF.' });
     }
 
 
