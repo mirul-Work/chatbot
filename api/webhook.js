@@ -1,27 +1,31 @@
+// api/webhook.js
+
 // Import modul yang diperlukan
-const axios = require('axios'); // Untuk membuat HTTP requests (mirip cURL)
-const { createClient } = require('@vercel/kv'); // Untuk Vercel KV (pengganti chat_history.json)
+const axios = require('axios');
+const Redis = require('ioredis'); // Import ioredis
 
 // --- KELAYAKAN API (Diambil dari Environment Variables) ---
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN; // Tidak digunakan dalam bot WhatsApp ini, tapi kekalkan
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;     // Tidak digunakan
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.0-flash'; // Default model
 
 const ULTRAMSG_API_TOKEN = process.env.ULTRAMSG_API_TOKEN;
 const ULTRAMSG_INSTANCE_ID = process.env.ULTRAMSG_INSTANCE_ID;
 
-// --- KONFIGURASI VERSEL KV ---
-// Kredensial KV akan dijana secara automatik oleh Vercel apabila anda menyambung KV Store
-const kv = createClient({
-  url: process.env.VERCEL_KV_URL,
-  token: process.env.VERCEL_KV_REST_API_TOKEN,
-});
+// --- KONFIGURASI REDIS (MENGGUNAKAN REDIS_URL) ---
+// Pastikan REDIS_URL telah ditetapkan dalam Environment Variables Vercel anda
+const REDIS_URL = process.env.REDIS_URL;
+let redisClient; // Declare client outside to reuse connection
 
+if (!REDIS_URL) {
+    console.error('ERROR: REDIS_URL environment variable is not set. Chat history and bot status will not persist.');
+} else {
+    redisClient = new Redis(REDIS_URL);
+
+    redisClient.on('connect', () => console.log('[INFO] Connected to Redis!'));
+    redisClient.on('error', (err) => console.error('[ERROR] Redis Client Error', err));
+}
 
 // --- NOMBOR TELEFON DIBENARKAN (Hardcoded) ---
-// Gantikan dengan nombor telefon WhatsApp yang anda benarkan.
-// Gunakan format bersih tanpa '@c.us' atau '+', contoh: '60123456789'
 const ALLOWED_NUMBERS = [
     '601135027311', // Contoh: NOMBOR TELEFON ANDA. Pastikan ini adalah nombor yang anda gunakan untuk menguji bot!
     '601116649357',
@@ -61,21 +65,29 @@ function logMessage(level, message) {
     console.log(`[${timestamp}] [${level}] ${message}`);
 }
 
-// --- FUNGSI MANIPULASI CHAT HISTORY (Guna Vercel KV) ---
+// --- FUNGSI MANIPULASI CHAT HISTORY (Guna Redis) ---
 async function getWhatsAppUserChatHistory(userId) {
+    if (!redisClient) {
+        logMessage('WARNING', 'Redis client not initialized. Cannot load chat history.');
+        return [];
+    }
     try {
-        const history = await kv.get(`chat_history:${userId}`);
-        return history && Array.isArray(history.messages) ? history.messages : [];
+        const historyJson = await redisClient.get(`chat_history:${userId}`);
+        const history = historyJson ? JSON.parse(historyJson).messages : [];
+        return Array.isArray(history) ? history : [];
     } catch (error) {
-        logMessage('ERROR', `Failed to load chat history for ${userId} from KV: ${error.message}`);
+        logMessage('ERROR', `Failed to load chat history for ${userId} from Redis: ${error.message}`);
         return [];
     }
 }
 
 async function addWhatsAppMessageToHistory(userId, messageText, role) {
+    if (!redisClient) {
+        logMessage('WARNING', 'Redis client not initialized. Cannot save chat history.');
+        return false;
+    }
     try {
-        let history = await kv.get(`chat_history:${userId}`);
-        history = history && Array.isArray(history.messages) ? history.messages : [];
+        let history = await getWhatsAppUserChatHistory(userId); // Get current history
 
         const maxMessages = 20;
         const newMessage = {
@@ -90,22 +102,26 @@ async function addWhatsAppMessageToHistory(userId, messageText, role) {
             history = history.slice(history.length - maxMessages);
         }
 
-        await kv.set(`chat_history:${userId}`, { messages: history });
-        logMessage('INFO', `Message added to KV history for ${userId}. Current history length: ${history.length}`);
+        await redisClient.set(`chat_history:${userId}`, JSON.stringify({ messages: history }));
+        logMessage('INFO', `Message added to Redis history for ${userId}. Current history length: ${history.length}`);
         return true;
     } catch (error) {
-        logMessage('ERROR', `Failed to add message to KV history for ${userId}: ${error.message}`);
+        logMessage('ERROR', `Failed to add message to Redis history for ${userId}: ${error.message}`);
         return false;
     }
 }
 
 async function clearWhatsAppUserChatHistory(userId) {
+    if (!redisClient) {
+        logMessage('WARNING', 'Redis client not initialized. Cannot clear chat history.');
+        return false;
+    }
     try {
-        await kv.del(`chat_history:${userId}`);
-        logMessage('INFO', `Chat history cleared for ${userId} in KV.`);
+        await redisClient.del(`chat_history:${userId}`);
+        logMessage('INFO', `Chat history cleared for ${userId} in Redis.`);
         return true;
     } catch (error) {
-        logMessage('ERROR', `Failed to clear chat history for ${userId} in KV: ${error.message}`);
+        logMessage('ERROR', `Failed to clear chat history for ${userId} in Redis: ${error.message}`);
         return false;
     }
 }
@@ -113,9 +129,6 @@ async function clearWhatsAppUserChatHistory(userId) {
 
 // --- FUNGSI ESCAPE UNTUK WHATSAPP ---
 function escapeWhatsAppText(text) {
-    // WhatsApp API (UltraMsg) biasanya lebih mudah, tidak memerlukan escape serumit Telegram MarkdownV2.
-    // Karakter seperti `.` tidak perlu di-escape.
-    // Jika anda menggunakan formatting *bold* atau _italic_ dalam teks, ia akan berfungsi terus.
     return text;
 }
 
@@ -149,7 +162,7 @@ async function getGeminiResponse(promptText, aiRules, aiPersonality, userId) {
         }
         contents.push({ role: roleToAdd, parts: [{ text: textToAdd }] });
     }
-    logMessage('DEBUG', `Loaded ${chatHistory.length} messages from KV history for user ID ${userId}.`);
+    logMessage('DEBUG', `Loaded ${chatHistory.length} messages from Redis history for user ID ${userId}.`);
 
     contents.push({ role: 'user', parts: [{ text: promptText }] });
 
@@ -158,7 +171,7 @@ async function getGeminiResponse(promptText, aiRules, aiPersonality, userId) {
     try {
         const response = await axios.post(url, payload, {
             headers: { 'Content-Type': 'application/json' },
-            timeout: 30000 // 30 seconds timeout
+            timeout: 30000
         });
 
         const data = response.data;
@@ -222,11 +235,11 @@ async function sendUltraMsgMessage(toPhoneNumber, text, replyToMessageId = null)
     try {
         const response = await axios.post(url, payload, {
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            timeout: 30000 // 30 seconds timeout
+            timeout: 30000
         });
 
         const data = response.data;
-        if (data.sent === 'false') { // UltraMsg returns sent: 'true' or 'false'
+        if (data.sent === 'false') {
             logMessage('ERROR', `Failed to send UltraMsg message to ${toPhoneNumber}. Details: ${data.error || 'Unknown error'}`);
         } else {
             logMessage('INFO', `UltraMsg message sent successfully to ${toPhoneNumber}. ID: ${data.id || 'N/A'}`);
@@ -248,14 +261,43 @@ async function sendUltraMsgMessage(toPhoneNumber, text, replyToMessageId = null)
 module.exports = async (req, res) => {
     // Pastikan ini adalah permintaan POST
     if (req.method !== 'POST') {
-        logMessage('WARNING', `Received non-POST request: ${req.method}`);
+        logMessage('WARNING', `Received non-POST request to webhook: ${req.method}`);
         return res.status(405).json({ status: 'error', message: 'Method Not Allowed' });
     }
 
-    const update = req.body; // Vercel secara automatik parse JSON body
+    // --- Semak Status Bot ON/OFF ---
+    let isBotOn = true; // Default ke ON jika status tak dapat dibaca
+    if (redisClient) { // Hanya cuba baca jika client dah bersambung
+        try {
+            const status = await redisClient.get('bot_status'); // Ambil dari Redis
+            if (status !== null) {
+                const parsedStatus = JSON.parse(status); // Redis simpan string, perlu parse
+                if (typeof parsedStatus === 'object' && typeof parsedStatus.isOn === 'boolean') {
+                    isBotOn = parsedStatus.isOn;
+                }
+            } else {
+                // Jika status belum ada, setkan ke ON dan simpan
+                await redisClient.set('bot_status', JSON.stringify({ isOn: true }));
+                isBotOn = true;
+                logMessage('INFO', 'Bot status initialized to ON in Redis.');
+            }
+        } catch (error) {
+            logMessage('ERROR', `Failed to read bot status from Redis: ${error.message}. Assuming bot is ON.`);
+        }
+    } else {
+        logMessage('WARNING', 'Redis client not initialized. Cannot check bot status. Assuming bot is ON.');
+    }
+
+
+    if (!isBotOn) {
+        logMessage('INFO', 'Bot is currently OFF. Ignoring incoming message.');
+        return res.status(200).json({ status: 'ok', message: 'Bot is OFF.' }); // Beritahu UltraMsg bot OFF
+    }
+
+
+    const update = req.body;
     logMessage('INFO', `Received UltraMsg Update. Raw data: ${JSON.stringify(update)}`);
 
-    // Pastikan ini adalah update yang sah dari UltraMsg
     if (!update || !update.event_type || !update.data) {
         logMessage('WARNING', 'Invalid UltraMsg update format received.');
         return res.status(200).json({ status: 'ok', message: 'Not a valid UltraMsg update.' });
@@ -279,16 +321,15 @@ module.exports = async (req, res) => {
         return res.status(200).json({ status: 'ok', message: 'No sender phone number found.' });
     }
 
-    // --- SEMAK NOMBOR DIBENARKAN ---
     if (!ALLOWED_NUMBERS.includes(currentWhatsAppUserId)) {
         logMessage('WARNING', `Mesej dari nombor TIDAK DIBENARKAN: ${currentWhatsAppUserId}. Mengabaikan mesej.`);
-        return res.status(200).json({ status: 'ok', message: 'Nombor tidak dibenarkan.' }); // Terus keluar, abaikan sepenuhnya
+        return res.status(200).json({ status: 'ok', message: 'Nombor tidak dibenarkan.' });
     }
 
     logMessage('INFO', `Processing message from WhatsApp User ID: ${currentWhatsAppUserId}`);
 
-    const effectiveAiRules = AI_RULES; // Dari hardcoded global const
-    const effectiveAiPersonality = AI_PERSONALITY; // Dari hardcoded global const
+    const effectiveAiRules = AI_RULES;
+    const effectiveAiPersonality = AI_PERSONALITY;
 
     let responseText = "Maaf, saya tak faham mesej jenis ni. Tolong hantar teks biasa je. 😉";
 
