@@ -1,13 +1,13 @@
 {
   "name": "my-whatsapp-bot",
   "version": "1.0.0",
-  "description": "WhatsApp AI Bot using Vercel and UltraMsg",
+  "description": "WhatsApp AI Bot using Vercel and UltraMsg with Neon Postgres",
   "main": "api/webhook.js",
   "scripts": {
     "start": "vercel dev"
   },
   "dependencies": {
     "axios": "^1.6.8",
-    "ioredis": "^5.0.0"
+    "pg": "^8.12.0" 
   }
 }
