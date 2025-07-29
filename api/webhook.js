@@ -2,14 +2,15 @@
 
 // Import modul yang diperlukan
 const axios = require('axios');
-const { Pool } = require('pg'); // Import Node.js Postgres client
+const { Pool } = require('pg'); // Node.js Postgres client
 
 // --- KELAYAKAN API (Diambil dari Environment Variables) ---
+// Pastikan anda telah set variable ini di Vercel Dashboard -> Project Settings -> Environment Variables
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
 
-const ULTRAMSG_API_TOKEN = process.env.ULTRAMSG_API_TOKEN;
-const ULTRAMSG_INSTANCE_ID = process.env.ULTRAMSG_INSTANCE_ID;
+const SIDOBE_API_URL = process.env.SIDOBE_API_URL; // e.g., https://api.sidobe.com/wa/v1
+const SIDOBE_SECRET_KEY = process.env.SIDOBE_SECRET_KEY; // Your secret key from Sidobe dashboard
 
 // --- NOMBOR TELEFON DIBENARKAN (Hardcoded) ---
 const ALLOWED_NUMBERS = [
@@ -128,7 +129,7 @@ async function clearWhatsAppUserChatHistory(userId) {
 async function getBotStatus() {
     if (!pgPool) {
         logMessage('WARNING', 'Postgres client not initialized. Cannot load bot status.');
-        return { isOn: true, error: 'DB not connected' }; // Default to ON if DB issue
+        return { isOn: true, error: 'DB not connected' };
     }
     try {
         const result = await pgPool.query(
@@ -137,7 +138,6 @@ async function getBotStatus() {
         if (result.rows.length > 0) {
             return { isOn: result.rows[0].is_on };
         } else {
-            // If status key not found, initialize it
             await pgPool.query(
                 `INSERT INTO bot_status (status_key, is_on) VALUES ('main_bot_status', TRUE) ON CONFLICT (status_key) DO NOTHING`
             );
@@ -156,7 +156,7 @@ async function setBotStatus(statusBoolean) {
     }
     try {
         await pgPool.query(
-            `INSERT INTO bot_status (status_key, is_on) VALUES ('main_bot_status', $1) ON CONFLICT (status_key) DO UPDATE SET is_on = $1`,
+            `UPDATE bot_status SET is_on = $1 WHERE status_key = 'main_bot_status'`,
             [statusBoolean]
         );
         logMessage('INFO', `Bot status set to ${statusBoolean} in Postgres.`);
@@ -170,7 +170,7 @@ async function setBotStatus(statusBoolean) {
 
 // --- FUNGSI ESCAPE UNTUK WHATSAPP ---
 function escapeWhatsAppText(text) {
-    return text;
+    return text; // Sidobe API mungkin tidak memerlukan escape khas untuk mesej teks biasa.
 }
 
 
@@ -260,38 +260,41 @@ async function getGeminiResponse(promptText, aiRules, aiPersonality, userId) {
     }
 }
 
-// --- Fungsi untuk menghantar mesej teks ke UltraMsg (WhatsApp) ---
-async function sendUltraMsgMessage(toPhoneNumber, text, replyToMessageId = null) {
-    logMessage('INFO', `Sending UltraMsg message to: ${toPhoneNumber}. Text: '${text}'`);
+// --- Fungsi untuk menghantar mesej teks ke Sidobe (WhatsApp) ---
+async function sendSidobeMessage(toPhoneNumber, text) {
+    logMessage('INFO', `Sending Sidobe message to: ${toPhoneNumber}. Text: '${text}'`);
     
-    const url = `https://api.ultramsg.com/${ULTRAMSG_INSTANCE_ID}/messages/chat?token=${ULTRAMSG_API_TOKEN}`; // Token di URL
-    const payload = new URLSearchParams();
-    payload.append('to', toPhoneNumber);
-    payload.append('body', escapeWhatsAppText(text));
-
-    if (replyToMessageId) {
-        payload.append('replyMessageId', replyToMessageId);
-    }
+    const url = `${SIDOBE_API_URL}/send-message`; // Contoh endpoint Sidobe untuk hantar mesej
+    const payload = {
+        number: toPhoneNumber,
+        message: escapeWhatsAppText(text),
+        // Tambah API Key/Secret Key ke payload atau header bergantung pada dokumentasi Sidobe
+        // Saya akan letak dalam header Authorization untuk keselamatan yang lebih baik
+        // Tetapi kalau Sidobe guna GET parameter atau POST body biasa, kita kena sesuaikan
+    };
 
     try {
         const response = await axios.post(url, payload, {
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            headers: { 
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${SIDOBE_SECRET_KEY}` // Andaian: Sidobe guna Bearer Token
+            },
             timeout: 30000
         });
 
         const data = response.data;
-        if (data.sent === 'false') {
-            logMessage('ERROR', `Failed to send UltraMsg message to ${toPhoneNumber}. Details: ${data.error || 'Unknown error'}`);
+        if (data.status === 'success' || data.sent) { // Andaian: Sidobe balas status: 'success' atau 'sent' true
+            logMessage('INFO', `Sidobe message sent successfully to ${toPhoneNumber}. Response: ${JSON.stringify(data)}`);
         } else {
-            logMessage('INFO', `UltraMsg message sent successfully to ${toPhoneNumber}. ID: ${data.id || 'N/A'}`);
+            logMessage('ERROR', `Failed to send Sidobe message to ${toPhoneNumber}. Details: ${data.message || data.error || 'Unknown Sidobe error'}`);
         }
         return data;
     } catch (error) {
-        logMessage('ERROR', `UltraMsg API request failed: ${error.message || error}`);
+        logMessage('ERROR', `Sidobe API request failed: ${error.message || error}`);
         if (error.response) {
-            logMessage('ERROR', `UltraMsg API error response data: ${JSON.stringify(error.response.data)}`);
+            logMessage('ERROR', `Sidobe API error response data: ${JSON.stringify(error.response.data)}`);
         }
-        return { sent: 'false', error: `Network error: ${error.message}` };
+        return { status: 'error', message: `Network error: ${error.message}` };
     }
 }
 
@@ -306,8 +309,8 @@ module.exports = async (req, res) => {
     }
 
     // --- Semak Status Bot ON/OFF ---
-    let isBotOn = true; // Default ke ON
-    const botStatus = await getBotStatus(); // Dapatkan status dari DB
+    let isBotOn = true;
+    const botStatus = await getBotStatus();
     isBotOn = botStatus.isOn;
     if (botStatus.error) {
         logMessage('WARNING', `Error getting bot status: ${botStatus.error}. Assuming bot is ON.`);
@@ -320,28 +323,28 @@ module.exports = async (req, res) => {
 
 
     const update = req.body;
-    logMessage('INFO', `Received UltraMsg Update. Raw data: ${JSON.stringify(update)}`);
+    logMessage('INFO', `Received WhatsApp Update. Raw data: ${JSON.stringify(update)}`);
 
-    if (!update || !update.event_type || !update.data) {
-        logMessage('WARNING', 'Invalid UltraMsg update format received.');
-        return res.status(200).json({ status: 'ok', message: 'Not a valid UltraMsg update.' });
-    }
+    // --- PENTING: Struktur Webhook Sidobe - INI ADALAH ANDAIAN ---
+    // Saya mengandaikan Sidobe menghantar data JSON yang mengandungi
+    // nombor pengirim dan teks mesej. Anda mungkin perlu SESUAIKAN INI.
+    // Sila semak dokumentasi Sidobe anda untuk struktur data webhook yang tepat.
+    const fromPhoneNumberWithSuffix = update.from || update.data.from || null; // Andaian: 'from' field
+    const messageText = update.body || update.data.body || update.message || null; // Andaian: 'body' atau 'message' field
+    const messageId = update.id || update.data.id || null; // Andaian: 'id' field
+    const messageType = update.type || update.data.type || 'chat'; // Andaian: 'type' field, default 'chat'
 
-    const fromPhoneNumberWithSuffix = update.data.from;
-    const messageTextUltramsg = update.data.body;
-    const messageIdUltramsg = update.data.id;
-    const messageTypeUltramsg = update.data.type;
 
     let fromPhoneNumberClean = null;
     if (fromPhoneNumberWithSuffix) {
         const parts = fromPhoneNumberWithSuffix.split('@');
-        fromPhoneNumberClean = parts[0];
+        fromPhoneNumberClean = parts[0]; // Buang '@c.us' jika ada
     }
 
     const currentWhatsAppUserId = fromPhoneNumberClean;
 
     if (!currentWhatsAppUserId) {
-        logMessage('WARNING', 'No sender phone number found in UltraMsg update.');
+        logMessage('WARNING', 'No sender phone number found in WhatsApp update.');
         return res.status(200).json({ status: 'ok', message: 'No sender phone number found.' });
     }
 
@@ -357,11 +360,11 @@ module.exports = async (req, res) => {
 
     let responseText = "Maaf, saya tak faham mesej jenis ni. Tolong hantar teks biasa je. 😉";
 
-    if (messageTypeUltramsg === 'chat' && messageTextUltramsg) {
-        logMessage('INFO', `WhatsApp User text message: '${messageTextUltramsg}'`);
-        if (messageTextUltramsg.toLowerCase().startsWith('/start') || messageTextUltramsg.toLowerCase().startsWith('/hello')) {
+    if (messageType === 'chat' && messageText) {
+        logMessage('INFO', `WhatsApp User text message: '${messageText}'`);
+        if (messageText.toLowerCase().startsWith('/start') || messageText.toLowerCase().startsWith('/hello')) {
             responseText = "Hai! Saya bot AI WhatsApp you. Apa yang saya boleh bantu?";
-        } else if (messageTextUltramsg.toLowerCase().startsWith('/clear_chat')) {
+        } else if (messageText.toLowerCase().startsWith('/clear_chat')) {
             const success = await clearWhatsAppUserChatHistory(currentWhatsAppUserId);
             if (success) {
                 responseText = "Sejarah chat you dah dikosongkan. Jom start fresh.";
@@ -371,22 +374,22 @@ module.exports = async (req, res) => {
                 logMessage('ERROR', `Failed to clear WhatsApp chat history for user ID ${currentWhatsAppUserId}.`);
             }
         } else {
-            responseText = await getGeminiResponse(messageTextUltramsg, effectiveAiRules, effectiveAiPersonality, currentWhatsAppUserId);
+            responseText = await getGeminiResponse(messageText, effectiveAiRules, effectiveAiPersonality, currentWhatsAppUserId);
         }
-    } else if (['image', 'video', 'document', 'location'].includes(messageTypeUltramsg)) {
-        logMessage('INFO', `WhatsApp User sent a ${messageTypeUltramsg} message.`);
+    } else if (['image', 'video', 'document', 'location'].includes(messageType)) {
+        logMessage('INFO', `WhatsApp User sent a ${messageType} message.`);
         responseText = "I dah terima media/lokasi you. Tapi buat masa ni I hanya boleh reply mesej teks biasa je. Sorry tau! 😉";
     } else {
-        logMessage('INFO', `WhatsApp User sent an unsupported message type: ${messageTypeUltramsg}.`);
+        logMessage('INFO', `WhatsApp User sent an unsupported message type: ${messageType}.`);
         responseText = "Maaf, saya tak faham mesej jenis ni. Tolong hantar teks biasa je buat masa ni. 😉";
     }
 
-    const ultramsgResponse = await sendUltraMsgMessage(fromPhoneNumberClean, responseText, messageIdUltramsg);
+    const sidobeResponse = await sendSidobeMessage(fromPhoneNumberClean, responseText); // messageId tidak disokong oleh Sidobe (buat masa ini)
 
-    if (ultramsgResponse.sent === 'false') {
-        logMessage('ERROR', `Final UltraMsg response failed to send to ${fromPhoneNumberClean}. Details: ${JSON.stringify(ultramsgResponse)}`);
+    if (sidobeResponse.status === 'error' || sidobeResponse.success === false) { // Andaian: Sidobe balas {status: 'error'} atau {success: false}
+        logMessage('ERROR', `Final Sidobe response failed to send to ${fromPhoneNumberClean}. Details: ${JSON.stringify(sidobeResponse)}`);
     } else {
-        logMessage('INFO', `Final UltraMsg response sent successfully to ${fromPhoneNumberClean}.`);
+        logMessage('INFO', `Final Sidobe response sent successfully to ${fromPhoneNumberClean}.`);
     }
 
     return res.status(200).json({ status: 'ok', message: 'Update processed' });

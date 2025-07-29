@@ -1,5 +1,5 @@
 // api/status.js
-const { Pool } = require('pg'); // Import Node.js Postgres client
+const { Pool } = require('pg'); // Node.js Postgres client
 
 // --- KONFIGURASI DATABASE POSTGRES (NEON) ---
 const POSTGRES_URL = process.env.POSTGRES_URL; // Gunakan URL sambungan penuh
@@ -140,7 +140,8 @@ module.exports = async (req, res) => {
                 botIsOn = newStatus;
                 message = `Bot berjaya ditukar ke status: ${botIsOn ? 'ON' : 'OFF'}.`;
                 console.log(`[INFO] Bot status successfully toggled to ${botIsOn ? 'ON' : 'OFF'}.`);
-            } catch (error) {
+            }
+            catch (error) {
                 message = `Ralat menukar status bot: ${error.message}`;
                 console.error(`[ERROR] Failed to toggle bot status in Postgres: ${error.message}`);
             }
