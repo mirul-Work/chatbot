@@ -1,8 +1,8 @@
 {
-  "name": "my-telegram-ai-bot",
+  "name": "my-whatsapp-bot",
   "version": "1.0.0",
-  "description": "Telegram AI Bot using Vercel and Neon Postgres",
-  "main": "api/webhook_telegram.js", 
+  "description": "WhatsApp AI Bot using Vercel and UltraMsg with Neon Postgres",
+  "main": "api/webhook.js",
   "scripts": {
     "start": "vercel dev"
   },
